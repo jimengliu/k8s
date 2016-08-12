@@ -1,0 +1,20 @@
+kind: Pod
+apiVersion: v1
+metadata:
+  name: my-pod-aws
+  labels:
+    name: frontendhttp
+spec:
+  containers:
+    - name: myfrontend
+      image: nginx
+      ports:
+        - containerPort: 8080
+          name: "http-server"
+      volumeMounts:
+      - mountPath: "/usr/share/nginx/html"
+        name: mypd-aws-vol
+  volumes:
+    - name: mypd-aws-vol
+      persistentVolumeClaim:
+       claimName: myclaim-aws
