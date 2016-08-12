@@ -54,17 +54,15 @@ detach() {
 }
 
 domount() {
+	# $2 should be <mount device> if attach() return a device, otherwise, <json params> is $2
 	SERVER=$(echo $2 | jq -r '.server')
 	EXPORT=$(echo $2 | jq -r '.path')
 
 	MNTPATH=$1
-
 	if [ $(ismounted) -eq 1 ] ; then
 		log "{\"status\": \"Success\"}"
 		exit 0
 	fi
-
-	mkdir -p ${MNTPATH} &> /dev/null
 
 	mount ${SERVER}:${EXPORT} ${MNTPATH} &> /dev/null
 	if [ $? -ne 0 ]; then
@@ -87,7 +85,6 @@ unmount() {
 		err "{ \"status\": \"Failed\", \"message\": \"Failed to unmount volume at ${MNTPATH}\"}"
 		exit 1
 	fi
-	#rmdir ${MNTPATH} &> /dev/null
 
 	log "{\"status\": \"Success\"}"
 	exit 0
