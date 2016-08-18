@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flex
+spec:
+  containers:
+  - name: flex
+    image: nginx
+    volumeMounts:
+    - name: test
+      mountPath: /data
+    ports:
+    - containerPort: 80
+  volumes:
+  - name: test
+    flexVolume:
+      driver: "rancher.io/myFlexAWS"
+      fsType: "ext4"
+      options:
+        volumeID: "vol-6e8abddb"
