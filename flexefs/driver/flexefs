@@ -1,0 +1,123 @@
+#!/bin/bash
+
+# Notes:
+#  - Please install "jq" package before using this driver.
+
+usage() {
+       	err "Invalid usage. Usage: "
+       	err "\t$0 init"
+       	err "\t$0 attach <json params>"
+       	err "\t$0 detach <mount device>"
+       	err "\t$0 mount <mount dir> <mount device> <json params>"
+       	err "\t$0 unmount <mount dir>"
+       	exit 1
+}
+
+err() {
+       	echo -ne $* 1>&2
+}
+
+log() {
+       	echo -ne $* >&1
+}
+
+ismounted() {
+       	MOUNT=`findmnt -n ${MNTPATH} 2>/dev/null | cut -d' ' -f1`
+       	if [ "${MOUNT}" == "${MNTPATH}" ]; then
+       		echo "1"
+       	else
+       		echo "0"
+       	fi
+}
+
+attach() {
+        log "{\"status\": \"Success\"}"
+       	exit 0
+}
+
+detach() {
+       	log "{\"status\": \"Success\"}"
+       	exit 0
+}
+
+domount() {
+       	# $2 should be <mount device> if attach() return a device, otherwise, <json params> is $2
+       	FSID=$(echo $2 | jq -r '.fsid')
+       	EXPORT=$(echo $2 | jq -r '.path')
+
+       	OPTIONS=$(echo $2 | jq -r '.options')
+       	if [ "${OPTIONS}" != "null" ]; then
+                OPTIONS="-o ${OPTIONS}"
+       	else
+       		OPTIONS=""
+        fi
+
+       	MNTPATH=$1
+
+       	if [ $(ismounted) -eq 1 ] ; then
+       		log "{\"status\": \"Success\"}"
+       		exit 0
+       	fi
+
+       	EC2_AVAIL_ZONE=`curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone`
+       	EC2_REGION="`echo \"$EC2_AVAIL_ZONE\" | sed -e 's:\([0-9][0-9]*\)[a-z]*\$:\\1:'`"
+       	EFS_DNS_NAME=${EC2_AVAIL_ZONE}.${FSID}.efs.${EC2_REGION}.amazonaws.com
+
+       	mkdir -p ${MNTPATH} &> /dev/null
+        mount -t nfs4 ${OPTIONS} ${EFS_DNS_NAME}:${EXPORT} ${MNTPATH} &> /dev/null
+       	if [ $? -ne 0 ]; then
+       		err "{ \"status\": \"Failure\", \"message\": \"Failed to mount ${EFS_DNS_NAME}:${EXPORT} at ${MNTPATH}\"}"
+       		exit 1
+       	fi
+       	log "{\"status\": \"Success\"}"
+       	exit 0
+}
+
+unmount() {
+       	MNTPATH=$1
+       	if [ $(ismounted) -eq 0 ] ; then
+       		log "{\"status\": \"Success\"}"
+       		exit 0
+       	fi
+
+       	umount ${MNTPATH} &> /dev/null
+       	if [ $? -ne 0 ]; then
+       		err "{ \"status\": \"Failed\", \"message\": \"Failed to unmount volume at ${MNTPATH}\"}"
+       		exit 1
+       	fi
+
+       	log "{\"status\": \"Success\"}"
+       	exit 0
+}
+
+op=$1
+
+if [ "$op" = "init" ]; then
+       	log "{\"status\": \"Success\"}"
+       	exit 0
+fi
+
+if [ $# -lt 2 ]; then
+       	usage
+fi
+
+shift
+
+case "$op" in
+       	attach)
+       		attach $*
+       		;;
+       	detach)
+       		detach $*
+       		;;
+       	mount)
+       		domount $*
+       		;;
+       	unmount)
+       		unmount $*
+       		;;
+       	*)
+       		usage
+esac
+
+exit 1

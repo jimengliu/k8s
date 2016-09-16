@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: flex-efs-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  flexVolume:
+    driver: "rancher/flexefs"
+    options:
+      fsid: "fs-90d12d39"
+      path: "/"
+      options: "ro,vers=4.0"
