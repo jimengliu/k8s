@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# Notes:
+#  - Please install "jq" package before using this driver.
+
+usage() {
+    err "Invalid usage. Usage: "
+    err "\t$0 create <json params>"
+    err "\t$0 attach <json params>"
+    err "\t$0 detach <json params>"
+    err "\t$0 mount <mount dir> <json params>"
+    err "\t$0 unmount <mount dir> <json params>"
+    exit 1
+}
+
+err() {
+    echo -ne $* 1>&2
+}
+
+log() {
+    echo -ne $* >&1
+}
+
+DEVICE="/dev/xvdh"
+ismounted() {
+    MOUNT=`findmnt -n ${MNTPATH} 2>/dev/null | cut -d' ' -f1`
+    if [ "${MOUNT}" == "${MNTPATH}" ]; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+getMetaData() {
+    EC2_AVAIL_ZONE=`curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone`
+    EC2_REGION="`echo \"$EC2_AVAIL_ZONE\" | sed -e 's:\([0-9][0-9]*\)[a-z]*\$:\\1:'`"
+    INSTANCEID=`curl http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null`
+}
+
+detachIfAttached(){
+    VOLUMES=`aws ec2 describe-volumes --volume-ids ${VOLUMEID} --filters Name=availability-zone,Values=${EC2_AVAIL_ZONE} 2>&1`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${VOLUMES}\"}"
+        exit 1
+    fi
+
+    # get attached instance id
+    ATTACHED_INSTANCEID=$(echo ${VOLUMES} | jq -r '.Volumes[0].Attachments[0].InstanceId')
+
+    # check if volumeID is already attached to another instance
+    if [ "${ATTACHED_INSTANCEID}" != "null" ]; then
+        INSTANCE_STATUS=`aws ec2 describe-instance-status --instance-ids ${ATTACHED_INSTANCEID} --filters Name=availability-zone,Values=${EC2_AVAIL_ZONE} 2>&1`
+        if [ $? -ne 0 ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${INSTANCE_STATUS}\"}"
+            exit 1
+        fi
+
+        # if currently attached instance VM is running, we can't detach, error out here
+        STATUS=$(echo ${INSTANCE_STATUS} | jq -r '.InstanceStatuses[0].InstanceState.Name')
+        if [ "${STATUS}" == "running" ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"volume ${VOLUMEID} is currently attached to a running instance ${ATTACHED_INSTANCEID}, can't re-use it\"}"
+            exit 1
+        fi
+
+        # detach it from currently attached instance VM
+        ERR=`aws ec2 detach-volume --volume-id ${VOLUMEID} --instance-id ${ATTACHED_INSTANCEID} 2>&1`
+        if [ $? -ne 0 ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUMEID} from instance-id ${ATTACHED_INSTANCEID}. ${ERR}\"}"
+            exit 1
+        fi
+        sleep 10
+    fi
+}
+
+create() {
+    VOLUMEID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUMEID}" != "null" ]; then
+        exit 0
+    fi
+
+    NAME=$(echo $1 | jq -r '.name')
+    SIZE=$(echo $1 | jq -r '.size')
+    if [ "${NAME}" == "null" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"name is missing, can't create\"}"
+        exit 1
+    fi
+    if [ "${SIZENAME}" == "null" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"size is missing, can't create\"}"
+        exit 1
+    fi
+    TYPE=$(echo $1 | jq -r '.volumeType')
+    IOPS_OPTION=""
+    if [ "${TYPE}" == "io1" ]; then
+        IOPS=$(echo $1 | jq -r '.iops')
+        if [ "${IOPS}" != "null" ]; then
+            IOPS_OPTION="--iops ${IOPS}"
+        fi
+    fi
+
+    TYPE_OPTION=""
+    if [ "${TYPE}" != "null" ]; then
+        TYPE_OPTION="--volume-type ${TYPE}"
+    fi
+
+    getMetaData
+
+    # create a EBS volume using aws-cli
+    VOLUME=`aws ec2 create-volume --size ${SIZE} --region ${EC2_REGION} --availability-zone ${EC2_AVAIL_ZONE} ${TYPE_OPTION} ${IOPS_OPTION} 2>&1`
+    if [ $? -ne 0 ]; then
+        # now VOLUME is the error message
+        err "{ \"status\": \"Failure\", \"message\": \"Failed in create: ${VOLUME}\"}"
+        exit 1
+    fi
+    VOLUMEID=$(echo ${VOLUME} | jq -r '.VolumeId')
+
+    sleep 10
+
+    # tag the newly created volume
+    ERR=`aws ec2 create-tags --resources ${VOLUMEID} --tags Key=Name,Value=${NAME} 2>&1`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed in create: create-tags for volume ${VOLUMEID} Key=Name,Value=${NAME} failed. ${ERR}\"}"
+        exit 1
+    fi
+
+    sleep 10
+    log "{\"status\": \"Success\", \"VolumeId\":\"${VOLUMEID}\"}"
+    exit 0
+}
+
+
+attach() {
+    VOLUMEID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUMEID}" == "null" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't attach\"}"
+        exit 1
+    fi
+
+    getMetaData
+    detachIfAttached
+
+    VOLUME=`aws ec2 attach-volume --volume-id ${VOLUMEID} --instance-id ${INSTANCEID} --device ${DEVICE} >/dev/null 2>&1`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to attach ebs volume-id ${VOLUMEID} as device:${DEVICE} to aws instance-id ${INSTANCEID}. ${VOLUME}\"}"
+        exit 1
+    fi
+    # wait until the state is not attaching, for now just sleep 10 seconds
+    sleep 10
+    log "{\"status\":\"Success\", \"device\":\"${DEVICE}\"}"
+    exit 0
+}
+
+detach() {
+    VOLUMEID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUMEID}" == "null" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't detach\"}"
+        exit 1
+    fi
+
+    ERR=`aws ec2 detach-volume --volume-id ${VOLUMEID} >/dev/null 2>&1`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUMEID} from current instance. ${ERR}\"}"
+        exit 1
+    fi
+    sleep 10
+    log "{\"status\": \"Success\"}"
+    exit 0
+}
+
+domount() {
+    log "{\"status\": \"Not Supported\"}"
+    exit 0
+}
+
+unmount() {
+    log "{\"status\": \"Not Supported\"}"
+    exit 0
+}
+
+op=$1
+
+if [ $# -lt 2 ]; then
+    usage
+fi
+
+shift
+
+case "$op" in
+    create)
+        create $*
+        ;;
+    attach)
+        attach $*
+        ;;
+    detach)
+        detach $*
+        ;;
+    mount)
+        domount $*
+        ;;
+    unmount)
+        unmount $*
+        ;;
+    *)
+    usage
+esac
+
+exit 1
