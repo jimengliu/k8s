@@ -22,23 +22,13 @@ log() {
     echo -ne $* >&1
 }
 
-DEVICE="/dev/xvdh"
-ismounted() {
-    MOUNT=`findmnt -n ${MNTPATH} 2>/dev/null | cut -d' ' -f1`
-    if [ "${MOUNT}" == "${MNTPATH}" ]; then
-        echo "1"
-    else
-        echo "0"
-    fi
-}
-
-getMetaData() {
+get_meta_data() {
     EC2_AVAIL_ZONE=`curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone`
     EC2_REGION="`echo \"$EC2_AVAIL_ZONE\" | sed -e 's:\([0-9][0-9]*\)[a-z]*\$:\\1:'`"
     INSTANCEID=`curl http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null`
 }
 
-detachIfAttached(){
+detach_if_attached(){
     VOLUMES=`aws ec2 describe-volumes --volume-ids ${VOLUMEID} --filters Name=availability-zone,Values=${EC2_AVAIL_ZONE} 2>&1`
     if [ $? -ne 0 ]; then
         err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${VOLUMES}\"}"
@@ -73,6 +63,24 @@ detachIfAttached(){
     fi
 }
 
+find_available_device_path() {
+    ATTACHMENTS=`aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${INSTANCEID} | jq -r '.Volumes[].Attachments[]'`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume of instance-id ${INSTANCEID}. ${ATTACHMENTS}\"}"
+        exit 1
+    fi
+
+    PREFERED_DEVICE_PATHS="fghijklmnop"
+    for (( i=0; i<${#PREFERED_DEVICE_PATHS}; i++ )); do
+        CURRENT="/dev/sd${PREFERED_DEVICE_PATHS:$i:1}"
+        ATTACHMENT=`echo ${ATTACHMENTS} | jq "select(.Device==\"${CURRENT}\") | .Device"`
+        if [ "${ATTACHMENT}" == "" ]; then
+            echo ${CURRENT};
+            break
+        fi
+    done
+}
+
 create() {
     VOLUMEID=$(echo $1 | jq -r '.volumeID')
     if [ "${VOLUMEID}" != "null" ]; then
@@ -103,7 +111,7 @@ create() {
         TYPE_OPTION="--volume-type ${TYPE}"
     fi
 
-    getMetaData
+    get_meta_data
 
     # create a EBS volume using aws-cli
     VOLUME=`aws ec2 create-volume --size ${SIZE} --region ${EC2_REGION} --availability-zone ${EC2_AVAIL_ZONE} ${TYPE_OPTION} ${IOPS_OPTION} 2>&1`
@@ -123,7 +131,6 @@ create() {
         exit 1
     fi
 
-    sleep 10
     log "{\"status\": \"Success\", \"VolumeId\":\"${VOLUMEID}\"}"
     exit 0
 }
@@ -141,7 +148,6 @@ delete() {
         exit 1
     fi
 
-    sleep 10
     log "{\"status\": \"Success\"}"
     exit 0
 }
@@ -153,8 +159,9 @@ attach() {
         exit 1
     fi
 
-    getMetaData
-    detachIfAttached
+    get_meta_data
+    detach_if_attached
+    DEVICE=$(find_available_device_path)
 
     VOLUME=`aws ec2 attach-volume --volume-id ${VOLUMEID} --instance-id ${INSTANCEID} --device ${DEVICE} >/dev/null 2>&1`
     if [ $? -ne 0 ]; then
