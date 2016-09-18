@@ -6,6 +6,7 @@
 usage() {
     err "Invalid usage. Usage: "
     err "\t$0 create <json params>"
+    err "\t$0 delete <json params>"
     err "\t$0 attach <json params>"
     err "\t$0 detach <json params>"
     err "\t$0 mount <mount dir> <json params>"
@@ -127,6 +128,23 @@ create() {
     exit 0
 }
 
+delete() {
+    VOLUMEID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUMEID}" == "null" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't delete\"}"
+        exit 1
+    fi
+
+    ERR=`aws ec2 delete-volume --volume-id ${VOLUMEID} 2>&1`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to delete volume ${VOLUMEID}. ${ERR}\"}"
+        exit 1
+    fi
+
+    sleep 10
+    log "{\"status\": \"Success\"}"
+    exit 0
+}
 
 attach() {
     VOLUMEID=$(echo $1 | jq -r '.volumeID')
@@ -187,6 +205,9 @@ shift
 case "$op" in
     create)
         create $*
+        ;;
+    delete)
+        delete $*
         ;;
     attach)
         attach $*
