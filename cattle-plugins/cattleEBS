@@ -2,6 +2,7 @@
 
 # Notes:
 #  - Please install "jq" package before using this driver.
+WAIT_SLEEP_TIME_IN_SECONDS=2
 
 usage() {
     err "Invalid usage. Usage: "
@@ -15,136 +16,173 @@ usage() {
 }
 
 err() {
-    echo -ne $* 1>&2
+    echo -ne $@ 1>&2
 }
 
 log() {
-    echo -ne $* >&1
+    echo -ne $@ >&1
 }
 
 get_meta_data() {
     EC2_AVAIL_ZONE=`curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone`
     EC2_REGION="`echo \"$EC2_AVAIL_ZONE\" | sed -e 's:\([0-9][0-9]*\)[a-z]*\$:\\1:'`"
-    INSTANCEID=`curl http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null`
+    INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null`
+}
+
+wait_volume_transition() {
+    local current_state=$1
+    local start_state=$1
+    local end_state=$2
+    while [ "${current_state}" == "${start_state}" ]; do
+        sleep ${WAIT_SLEEP_TIME_IN_SECONDS}
+        local volumes=`aws ec2 describe-volumes --volume-ids ${VOLUME_ID} 2>&1`
+        if [ $? -ne 0 ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume ${VOLUME_ID}: ${volumes}\"}"
+            exit 1
+        fi
+        current_state=$(echo ${volumes} | jq -r '.Volumes[0].State')
+    done
+    if [ "${current_state}" != "${end_state}" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed volume ${VOLUME_ID} transition, expected end state is: ${end_state}, got ${current_state}\"}"
+        exit 1
+    fi
+
+}
+
+wait_volume_attaching() {
+    local attach_state="attaching"
+    while [ "$attach_state" == "attaching" ]; do
+        sleep ${WAIT_SLEEP_TIME_IN_SECONDS}
+        local volumes=`aws ec2 describe-volumes --volume-ids ${VOLUME_ID} 2>&1`
+        if [ $? -ne 0 ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume ${VOLUME_ID}: ${volumes}\"}"
+            exit 1
+        fi
+        attach_state=$(echo ${volumes} | jq -r '.Volumes[0].Attachments[0].State')
+    done
+    if [ "$attach_state" != "attached" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to attach volume ${VOLUME_ID}, final state is: ${attach_state}\"}"
+        exit 1
+    fi
 }
 
 detach_if_attached(){
-    VOLUMES=`aws ec2 describe-volumes --volume-ids ${VOLUMEID} --filters Name=availability-zone,Values=${EC2_AVAIL_ZONE} 2>&1`
+    local volumes=`aws ec2 describe-volumes --volume-ids ${VOLUME_ID} 2>&1`
     if [ $? -ne 0 ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${VOLUMES}\"}"
+        err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${volumes}\"}"
         exit 1
     fi
 
     # get attached instance id
-    ATTACHED_INSTANCEID=$(echo ${VOLUMES} | jq -r '.Volumes[0].Attachments[0].InstanceId')
+    local attached_instance_id=$(echo ${volumes} | jq -r '.Volumes[0].Attachments[0].InstanceId')
 
     # check if volumeID is already attached to another instance
-    if [ "${ATTACHED_INSTANCEID}" != "null" ]; then
-        INSTANCE_STATUS=`aws ec2 describe-instance-status --instance-ids ${ATTACHED_INSTANCEID} --filters Name=availability-zone,Values=${EC2_AVAIL_ZONE} 2>&1`
+    if [ "${attached_instance_id}" != "null" ]; then
+        local instance_status=`aws ec2 describe-instance-status --instance-ids ${attached_instance_id} 2>&1`
         if [ $? -ne 0 ]; then
-            err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${INSTANCE_STATUS}\"}"
+            err "{ \"status\": \"Failure\", \"message\": \"Failed in attach: ${instance_status}\"}"
             exit 1
         fi
 
         # if currently attached instance VM is running, we can't detach, error out here
-        STATUS=$(echo ${INSTANCE_STATUS} | jq -r '.InstanceStatuses[0].InstanceState.Name')
-        if [ "${STATUS}" == "running" ]; then
-            err "{ \"status\": \"Failure\", \"message\": \"volume ${VOLUMEID} is currently attached to a running instance ${ATTACHED_INSTANCEID}, can't re-use it\"}"
+        local status=$(echo ${instance_status} | jq -r '.InstanceStatuses[0].InstanceState.Name')
+        if [ "${status}" == "running" ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"volume ${VOLUME_ID} is currently attached to a running instance ${attached_instance_id}, can't detach/re-use it\"}"
             exit 1
         fi
 
         # detach it from currently attached instance VM
-        ERR=`aws ec2 detach-volume --volume-id ${VOLUMEID} --instance-id ${ATTACHED_INSTANCEID} 2>&1`
+        local error=`aws ec2 detach-volume --volume-id ${VOLUME_ID} --instance-id ${attached_instance_id} 2>&1`
         if [ $? -ne 0 ]; then
-            err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUMEID} from instance-id ${ATTACHED_INSTANCEID}. ${ERR}\"}"
+            err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUME_ID} from instance-id ${attached_instance_id}. ${error}\"}"
             exit 1
         fi
-        sleep 10
+        wait_volume_transition "in-use" "available"
     fi
 }
 
 find_available_device_path() {
-    ATTACHMENTS=`aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${INSTANCEID} | jq -r '.Volumes[].Attachments[]'`
+    local attachments=`aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${INSTANCE_ID} | jq -r '.Volumes[].Attachments[]'`
     if [ $? -ne 0 ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume of instance-id ${INSTANCEID}. ${ATTACHMENTS}\"}"
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume of instance-id ${INSTANCE_ID}. ${attachments}\"}"
         exit 1
     fi
 
-    PREFERED_DEVICE_PATHS="fghijklmnop"
-    for (( i=0; i<${#PREFERED_DEVICE_PATHS}; i++ )); do
-        CURRENT="/dev/sd${PREFERED_DEVICE_PATHS:$i:1}"
-        ATTACHMENT=`echo ${ATTACHMENTS} | jq "select(.Device==\"${CURRENT}\") | .Device"`
-        if [ "${ATTACHMENT}" == "" ]; then
-            echo ${CURRENT};
+    local prefered_device_paths="fghijklmnop"
+    for (( i=0; i<${#prefered_device_paths}; i++ )); do
+        local current="/dev/sd${prefered_device_paths:$i:1}"
+        local attachment=`echo ${attachments} | jq "select(.Device==\"${current}\") | .Device"`
+        if [ "${attachment}" == "" ]; then
+            echo ${current};
             break
         fi
     done
 }
 
 create() {
-    VOLUMEID=$(echo $1 | jq -r '.volumeID')
-    if [ "${VOLUMEID}" != "null" ]; then
+    VOLUME_ID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUME_ID}" != "null" ]; then
         exit 0
     fi
 
-    NAME=$(echo $1 | jq -r '.name')
-    SIZE=$(echo $1 | jq -r '.size')
-    if [ "${NAME}" == "null" ]; then
+    local name=$(echo $1 | jq -r '.name')
+    local size=$(echo $1 | jq -r '.size')
+    if [ "${name}" == "null" ]; then
         err "{ \"status\": \"Failure\", \"message\": \"name is missing, can't create\"}"
         exit 1
     fi
-    if [ "${SIZENAME}" == "null" ]; then
+    if [ "${size}" == "null" ]; then
         err "{ \"status\": \"Failure\", \"message\": \"size is missing, can't create\"}"
         exit 1
     fi
-    TYPE=$(echo $1 | jq -r '.volumeType')
-    IOPS_OPTION=""
-    if [ "${TYPE}" == "io1" ]; then
-        IOPS=$(echo $1 | jq -r '.iops')
-        if [ "${IOPS}" != "null" ]; then
-            IOPS_OPTION="--iops ${IOPS}"
+    local type=$(echo $1 | jq -r '.volumeType')
+    local iops_option=""
+    if [ "${type}" == "io1" ]; then
+        local iops=$(echo $1 | jq -r '.iops')
+        if [ "${iops}" != "null" ]; then
+            iops_option="--iops ${iops}"
         fi
     fi
 
-    TYPE_OPTION=""
-    if [ "${TYPE}" != "null" ]; then
-        TYPE_OPTION="--volume-type ${TYPE}"
+    local type_option=""
+    if [ "${type}" != "null" ]; then
+        type_option="--volume-type ${type}"
     fi
 
     get_meta_data
 
     # create a EBS volume using aws-cli
-    VOLUME=`aws ec2 create-volume --size ${SIZE} --region ${EC2_REGION} --availability-zone ${EC2_AVAIL_ZONE} ${TYPE_OPTION} ${IOPS_OPTION} 2>&1`
+    local volume=`aws ec2 create-volume --size ${size} --region ${EC2_REGION} --availability-zone ${EC2_AVAIL_ZONE} ${type_option} ${iops_option} 2>&1`
     if [ $? -ne 0 ]; then
-        # now VOLUME is the error message
-        err "{ \"status\": \"Failure\", \"message\": \"Failed in create: ${VOLUME}\"}"
+        # now volume is the error message
+        err "{ \"status\": \"Failure\", \"message\": \"Failed in create: ${volume}\"}"
         exit 1
     fi
-    VOLUMEID=$(echo ${VOLUME} | jq -r '.VolumeId')
+    VOLUME_ID=$(echo ${volume} | jq -r '.VolumeId')
 
-    sleep 10
+    wait_volume_transition "creating" "available"
 
     # tag the newly created volume
-    ERR=`aws ec2 create-tags --resources ${VOLUMEID} --tags Key=Name,Value=${NAME} 2>&1`
+    local error=`aws ec2 create-tags --resources ${VOLUME_ID} --tags Key=Name,Value=${name} 2>&1`
     if [ $? -ne 0 ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"Failed in create: create-tags for volume ${VOLUMEID} Key=Name,Value=${NAME} failed. ${ERR}\"}"
+        err "{ \"status\": \"Failure\", \"message\": \"Failed in create: create-tags for volume ${VOLUME_ID} Key=Name,Value=${name} failed. ${error}\"}"
         exit 1
     fi
 
-    log "{\"status\": \"Success\", \"VolumeId\":\"${VOLUMEID}\"}"
+    log "{\"status\": \"Success\", \"VolumeId\":\"${VOLUME_ID}\"}"
     exit 0
 }
 
 delete() {
-    VOLUMEID=$(echo $1 | jq -r '.volumeID')
-    if [ "${VOLUMEID}" == "null" ]; then
+    VOLUME_ID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUME_ID}" == "null" ]; then
         err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't delete\"}"
         exit 1
     fi
 
-    ERR=`aws ec2 delete-volume --volume-id ${VOLUMEID} 2>&1`
+    local error=`aws ec2 delete-volume --volume-id ${VOLUME_ID} 2>&1`
     if [ $? -ne 0 ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"Failed to delete volume ${VOLUMEID}. ${ERR}\"}"
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to delete volume ${VOLUME_ID}. ${error}\"}"
         exit 1
     fi
 
@@ -153,52 +191,52 @@ delete() {
 }
 
 attach() {
-    VOLUMEID=$(echo $1 | jq -r '.volumeID')
-    if [ "${VOLUMEID}" == "null" ]; then
+    VOLUME_ID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUME_ID}" == "null" ]; then
         err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't attach\"}"
         exit 1
     fi
 
     get_meta_data
     detach_if_attached
-    DEVICE=$(find_available_device_path)
+    local device_path=$(find_available_device_path)
 
-    VOLUME=`aws ec2 attach-volume --volume-id ${VOLUMEID} --instance-id ${INSTANCEID} --device ${DEVICE} >/dev/null 2>&1`
+    local error=`aws ec2 attach-volume --volume-id ${VOLUME_ID} --instance-id ${INSTANCE_ID} --device ${device_path} >/dev/null 2>&1`
     if [ $? -ne 0 ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"Failed to attach ebs volume-id ${VOLUMEID} as device:${DEVICE} to aws instance-id ${INSTANCEID}. ${VOLUME}\"}"
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to attach ebs volume-id ${VOLUME_ID} as device:${device_path} to aws instance-id ${INSTANCE_ID}. ${error}\"}"
         exit 1
     fi
-    # wait until the state is not attaching, for now just sleep 10 seconds
-    sleep 10
-    log "{\"status\":\"Success\", \"device\":\"${DEVICE}\"}"
+
+    wait_volume_attaching
+    log "{\"status\":\"Success\", \"device\":\"${device_path}\"}"
     exit 0
 }
 
 detach() {
-    VOLUMEID=$(echo $1 | jq -r '.volumeID')
-    if [ "${VOLUMEID}" == "null" ]; then
+    VOLUME_ID=$(echo $1 | jq -r '.volumeID')
+    if [ "${VOLUME_ID}" == "null" ]; then
         err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't detach\"}"
         exit 1
     fi
 
-    ERR=`aws ec2 detach-volume --volume-id ${VOLUMEID} >/dev/null 2>&1`
+    local error=`aws ec2 detach-volume --volume-id ${VOLUME_ID} >/dev/null 2>&1`
     if [ $? -ne 0 ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUMEID} from current instance. ${ERR}\"}"
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUME_ID} from current instance. ${error}\"}"
         exit 1
     fi
-    sleep 10
+    wait_volume_transition "in-use" "available"
     log "{\"status\": \"Success\"}"
     exit 0
 }
 
 domount() {
     log "{\"status\": \"Not Supported\"}"
-    exit 0
+    exit 1
 }
 
 unmount() {
     log "{\"status\": \"Not Supported\"}"
-    exit 0
+    exit 1
 }
 
 op=$1
@@ -211,22 +249,22 @@ shift
 
 case "$op" in
     create)
-        create $*
+        create $@
         ;;
     delete)
-        delete $*
+        delete $@
         ;;
     attach)
-        attach $*
+        attach $@
         ;;
     detach)
-        detach $*
+        detach $@
         ;;
     mount)
-        domount $*
+        domount $@
         ;;
     unmount)
-        unmount $*
+        unmount $@
         ;;
     *)
     usage
