@@ -122,6 +122,7 @@ find_available_device_path() {
 create() {
     VOLUME_ID=$(echo $1 | jq -r '.volumeID')
     if [ "${VOLUME_ID}" != "null" ]; then
+        log "{\"status\": \"Success\",\"options\":{}}"
         exit 0
     fi
 
@@ -169,12 +170,18 @@ create() {
         exit 1
     fi
 
-    log "{\"status\": \"Success\", \"VolumeId\":\"${VOLUME_ID}\"}"
+    log "{\"status\": \"Success\",\"options\":{\"created\":true,\"volumeID\":\"${VOLUME_ID}\"}}"
     exit 0
 }
 
 delete() {
-    VOLUME_ID=$(echo $1 | jq -r '.volumeID')
+    local created=$(echo $1 | jq -r '.options.created')
+    if [ "${created}" == "null" ]; then
+        log "{\"status\": \"Success\"}"
+        exit 0
+    fi
+
+    VOLUME_ID=$(echo $1 | jq -r '.options.volumeID')
     if [ "${VOLUME_ID}" == "null" ]; then
         err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't delete\"}"
         exit 1
