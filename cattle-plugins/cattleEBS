@@ -180,6 +180,18 @@ delete() {
         exit 1
     fi
 
+    local volumes=`aws ec2 describe-volumes --volume-ids ${VOLUME_ID} 2>&1`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume ${VOLUME_ID}: ${volumes}\"}"
+        exit 1
+    fi
+
+    current_state=$(echo ${volumes} | jq -r '.Volumes[0].State')
+    if [ "${current_state}" != "available" ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to delete volume ${VOLUME_ID}, current state: ${current_state} is not available\"}"
+        exit 1
+    fi
+
     local error=`aws ec2 delete-volume --volume-id ${VOLUME_ID} 2>&1`
     if [ $? -ne 0 ]; then
         err "{ \"status\": \"Failure\", \"message\": \"Failed to delete volume ${VOLUME_ID}. ${error}\"}"
