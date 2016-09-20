@@ -86,8 +86,8 @@ detach_if_attached(){
 
         # if currently attached instance VM is running, we can't detach, error out here
         local status=$(echo ${instance_status} | jq -r '.InstanceStatuses[0].InstanceState.Name')
-        if [ "${status}" == "running" ]; then
-            err "{ \"status\": \"Failure\", \"message\": \"volume ${VOLUME_ID} is currently attached to a running instance ${attached_instance_id}, can't detach/re-use it\"}"
+        if [ "${status}" == "running" ] && [ "${attached_instance_id}" != "${INSTANCE_ID}" ]; then
+            err "{ \"status\": \"Failure\", \"message\": \"volume ${VOLUME_ID} is currently attached to a running instance ${attached_instance_id}, can not detach or re-use it\"}"
             exit 1
         fi
 
@@ -111,11 +111,30 @@ find_available_device_path() {
     local prefered_device_paths="fghijklmnop"
     for (( i=0; i<${#prefered_device_paths}; i++ )); do
         local current="/dev/sd${prefered_device_paths:$i:1}"
-        local attachment=`echo ${attachments} | jq "select(.Device==\"${current}\") | .Device"`
-        if [ "${attachment}" == "" ]; then
+        local device=`echo ${attachments} | jq "select(.Device==\"${current}\") | .Device"`
+        if [ "${device}" == "" ]; then
             echo ${current};
             break
         fi
+    done
+}
+
+find_matching_linux_device_path() {
+    while true; do
+        local linux_device_path=`lsblk -o KNAME | sed -e 's/^/\/dev\//' | grep "$1"`
+        if [ "${linux_device_path}" == "$1" ]; then
+            echo ${linux_device_path}
+            break
+        fi
+
+        local device_new_format="/dev/xvd""${1: -1}"
+        local linux_device_path=`lsblk -o KNAME | sed -e 's/^/\/dev\//' | grep "${device_new_format}"`
+        if [ "${linux_device_path}" == "${device_new_format}" ]; then
+            echo ${linux_device_path}
+            break
+        fi
+
+        sleep ${WAIT_SLEEP_TIME_IN_SECONDS}
     done
 }
 
@@ -218,27 +237,46 @@ attach() {
 
     get_meta_data
     detach_if_attached
+
     local device_path=$(find_available_device_path)
 
-    local error=`aws ec2 attach-volume --volume-id ${VOLUME_ID} --instance-id ${INSTANCE_ID} --device ${device_path} >/dev/null 2>&1`
+    local error=`aws ec2 attach-volume --volume-id ${VOLUME_ID} --instance-id ${INSTANCE_ID} --device ${device_path} 2>&1`
     if [ $? -ne 0 ]; then
         err "{ \"status\": \"Failure\", \"message\": \"Failed to attach ebs volume-id ${VOLUME_ID} as device:${device_path} to aws instance-id ${INSTANCE_ID}. ${error}\"}"
         exit 1
     fi
 
     wait_volume_attaching
-    log "{\"status\":\"Success\", \"device\":\"${device_path}\"}"
+
+    # need to return real linux device path, it could be in a different format "sdf" => "xvdf"
+    local linux_device_path=$(find_matching_linux_device_path "${device_path}")
+
+    log "{\"status\":\"Success\", \"device\":\"${linux_device_path}\"}"
     exit 0
 }
 
 detach() {
-    VOLUME_ID=$(echo $1 | jq -r '.volumeID')
-    if [ "${VOLUME_ID}" == "null" ]; then
-        err "{ \"status\": \"Failure\", \"message\": \"volumeID is missing, can't detach\"}"
+    local aws_device_path="/dev/sd""${1: -1}"
+
+    get_meta_data
+
+    # from device, get VOLUME_ID
+    local attachments=`aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${INSTANCE_ID} | jq -r '.Volumes[].Attachments[]'`
+    if [ $? -ne 0 ]; then
+        err "{ \"status\": \"Failure\", \"message\": \"Failed to describe volume of instance-id ${INSTANCE_ID}. ${attachments}\"}"
         exit 1
     fi
 
-    local error=`aws ec2 detach-volume --volume-id ${VOLUME_ID} >/dev/null 2>&1`
+    VOLUME_ID=`echo ${attachments} | jq "select(.Device==\"${aws_device_path}\") | .VolumeId"`
+    VOLUME_ID=`echo ${VOLUME_ID=} | sed -e 's/^"//' -e 's/"$//'`
+
+    # no such device attached
+    if [ "${VOLUME_ID}" == "" ]; then
+        log "{\"status\": \"Success\"}"
+        exit 0
+    fi
+
+    local error=`aws ec2 detach-volume --volume-id ${VOLUME_ID} 2>&1`
     if [ $? -ne 0 ]; then
         err "{ \"status\": \"Failure\", \"message\": \"Failed to detach ebs volume-id ${VOLUME_ID} from current instance. ${error}\"}"
         exit 1
@@ -249,13 +287,13 @@ detach() {
 }
 
 domount() {
-    log "{\"status\": \"Not Supported\"}"
-    exit 1
+    log "{\"status\": \"Not supported\"}"
+    exit 0
 }
 
 unmount() {
-    log "{\"status\": \"Not Supported\"}"
-    exit 1
+    log "{\"status\": \"Not supported\"}"
+    exit 0
 }
 
 op=$1
