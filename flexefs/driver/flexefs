@@ -49,7 +49,7 @@ domount() {
        	if [ "${OPTIONS}" != "null" ]; then
                 OPTIONS="-o ${OPTIONS}"
        	else
-       		OPTIONS=""
+                OPTIONS="-o vers=4.1"
         fi
 
        	MNTPATH=$1
